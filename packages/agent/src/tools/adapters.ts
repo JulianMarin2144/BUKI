@@ -7,6 +7,7 @@ import { TOOL_SCHEMAS } from "./schemas";
 import { withTracking } from "./withTracking";
 import { executeBash } from "./bashExec";
 import { executeReadFile, executeWriteFile, executeEditFile } from "./fileTools";
+import { executeBukTool, type BukConfig } from "./buk";
 
 const GITHUB_API = "https://api.github.com";
 const GITHUB_UA = "10x-builders-agent/1.0";
@@ -18,6 +19,7 @@ export interface ToolContext {
   enabledTools: UserToolSetting[];
   integrations: UserIntegration[];
   githubToken?: string;
+  bukConfig?: BukConfig;
 }
 
 function isToolAvailable(toolId: string, ctx: ToolContext): boolean {
@@ -162,6 +164,21 @@ export const TOOL_HANDLERS: ToolHandlers = {
 
   github_create_repo: async (input, ctx) =>
     executeGitHubTool("github_create_repo", input, ctx.githubToken!),
+
+  buk_list_employees: async (input, ctx) =>
+    executeBukTool("buk_list_employees", input, ctx.bukConfig!),
+
+  buk_get_employee: async (input, ctx) =>
+    executeBukTool("buk_get_employee", input, ctx.bukConfig!),
+
+  buk_list_absences: async (input, ctx) =>
+    executeBukTool("buk_list_absences", input, ctx.bukConfig!),
+
+  buk_list_vacations: async (input, ctx) =>
+    executeBukTool("buk_list_vacations", input, ctx.bukConfig!),
+
+  buk_list_licenses: async (input, ctx) =>
+    executeBukTool("buk_list_licenses", input, ctx.bukConfig!),
 
   read_file: async (input: { path: string; offset?: number; limit?: number }) => {
     const result = await executeReadFile(input);

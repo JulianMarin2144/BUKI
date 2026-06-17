@@ -36,6 +36,20 @@ export const TOOL_SCHEMAS = {
     old_string: z.string().describe("Literal substring to find. Must appear exactly once in the file."),
     new_string: z.string().describe("Literal string that replaces the single occurrence of old_string."),
   }),
+  buk_list_employees: z.object({
+    page: z.number().int().min(1).optional().default(1),
+    page_size: z.number().int().min(1).max(30).optional().default(20),
+    area: z.string().optional().describe("Filter employees by area or department name (partial match)"),
+    name: z.string().optional().describe("Filter employees by name (partial match)"),
+  }),
+  buk_get_employee: z.object({
+    id: z.number().int().describe("Employee ID in BUK"),
+  }),
+  buk_list_absences: z.object({}),
+  buk_list_vacations: z.object({
+    employee_id: z.number().int().optional().describe("Optional employee ID to get available vacation days"),
+  }),
+  buk_list_licenses: z.object({}),
   bash: z.object({
     terminal: z.string().describe("Terminal identifier for correlation and logging"),
     prompt: z.string().max(4096).describe("Bash command to execute"),

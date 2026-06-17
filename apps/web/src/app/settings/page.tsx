@@ -31,6 +31,13 @@ export default async function SettingsPage() {
     .eq("provider", "github")
     .single();
 
+  const { data: bukIntegration } = await supabase
+    .from("user_integrations")
+    .select("*")
+    .eq("user_id", user.id)
+    .eq("provider", "buk")
+    .single();
+
   return (
     <div className="min-h-screen">
       <header className="border-b border-neutral-200 px-4 py-3 dark:border-neutral-800">
@@ -51,6 +58,7 @@ export default async function SettingsPage() {
           toolSettings={toolSettings ?? []}
           telegramLinked={!!telegramAccount}
           githubConnected={githubIntegration?.status === "active"}
+          bukConnected={bukIntegration?.status === "active"}
         />
       </main>
     </div>

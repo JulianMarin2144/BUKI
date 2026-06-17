@@ -45,6 +45,7 @@ export interface AgentInput {
   enabledTools: UserToolSetting[];
   integrations: UserIntegration[];
   githubToken?: string;
+  bukConfig?: { tenant: string; country: string; token: string };
   /** Skip HITL interrupts and auto-approve all tool calls. Use only for unattended runs (e.g. cron). */
   bypassConfirmation?: boolean;
 }
@@ -111,11 +112,12 @@ export async function runAgent(input: AgentInput): Promise<AgentOutput> {
     enabledTools,
     integrations,
     githubToken,
+    bukConfig,
     bypassConfirmation = false,
   } = input;
 
   const model = createChatModel();
-  const toolCtx: ToolContext = { db, userId, sessionId, enabledTools, integrations, githubToken };
+  const toolCtx: ToolContext = { db, userId, sessionId, enabledTools, integrations, githubToken, bukConfig };
   const lcTools = buildLangChainTools(toolCtx);
 
   const modelWithTools = lcTools.length > 0 ? model.bindTools(lcTools) : model;

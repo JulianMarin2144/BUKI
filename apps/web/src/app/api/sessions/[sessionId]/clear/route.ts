@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createServerClient, clearSessionMessages } from "@agents/db";
+import { clearCheckpoint } from "@agents/agent";
 
 export async function POST(
   _request: Request,
@@ -28,7 +29,11 @@ export async function POST(
   }
 
   const db = createServerClient();
-  await clearSessionMessages(db, sessionId);
+  // Clear both the app messages and the LangGraph checkpoint state
+  await Promise.all([
+    clearSessionMessages(db, sessionId),
+    clearCheckpoint(sessionId),
+  ]);
 
   return NextResponse.json({ ok: true });
 }

@@ -2,6 +2,7 @@
 
 import { useState, useRef, useEffect } from "react";
 import { createBrowserClient } from "@supabase/ssr";
+import ReactMarkdown from "react-markdown";
 
 interface PendingConfirmation {
   tool_call_id: string;
@@ -355,7 +356,13 @@ export function ChatInterface({
                       : "bg-neutral-100 text-neutral-900 dark:bg-neutral-800 dark:text-neutral-100"
                   }`}
                 >
-                  <p className="whitespace-pre-wrap">{msg.content}</p>
+                  {msg.role === "user" ? (
+                    <p className="whitespace-pre-wrap">{msg.content}</p>
+                  ) : (
+                    <div className="prose prose-sm max-w-none dark:prose-invert prose-p:my-1 prose-li:my-0.5 prose-ul:my-1 prose-ol:my-1 prose-strong:font-semibold">
+                      <ReactMarkdown>{msg.content}</ReactMarkdown>
+                    </div>
+                  )}
                   {msg.confirmation && msg.confirmationStatus === "pending" && (
                     <div className="mt-3 flex gap-2">
                       <button

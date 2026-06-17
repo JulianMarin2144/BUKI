@@ -17,7 +17,9 @@
     "@langfuse/otel": "^5.2.0",
     "@langfuse/tracing": "^5.2.0",
     "@opentelemetry/sdk-node": "^0.215.0",
+    "@types/pg": "^8.20.0",
     "croner": "^10.0.1",
+    "pg": "^8.21.0",
     "zod": "^3"
   },
   "devDependencies": {

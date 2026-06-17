@@ -11,9 +11,10 @@ interface Props {
   toolSettings: Array<{ tool_id: string; enabled: boolean }>;
   telegramLinked: boolean;
   githubConnected: boolean;
+  bukConnected: boolean;
 }
 
-export function SettingsForm({ userId, profile, toolSettings, telegramLinked, githubConnected }: Props) {
+export function SettingsForm({ userId, profile, toolSettings, telegramLinked, githubConnected, bukConnected }: Props) {
   const router = useRouter();
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -21,6 +22,16 @@ export function SettingsForm({ userId, profile, toolSettings, telegramLinked, gi
     githubConnected ? "connected" : "disconnected"
   );
   const [disconnecting, setDisconnecting] = useState(false);
+
+  const [bukStatus, setBukStatus] = useState<"connected" | "disconnected">(
+    bukConnected ? "connected" : "disconnected"
+  );
+  const [bukTenant, setBukTenant] = useState("");
+  const [bukCountry, setBukCountry] = useState("colombia");
+  const [bukToken, setBukToken] = useState("");
+  const [bukSaving, setBukSaving] = useState(false);
+  const [bukError, setBukError] = useState<string | null>(null);
+  const [bukDisconnecting, setBukDisconnecting] = useState(false);
 
   const [name, setName] = useState((profile?.name as string) ?? "");
   const [agentName, setAgentName] = useState((profile?.agent_name as string) ?? "Agente");
@@ -81,6 +92,45 @@ export function SettingsForm({ userId, profile, toolSettings, telegramLinked, gi
       }
     } finally {
       setDisconnecting(false);
+    }
+  }
+
+  async function handleConnectBuk() {
+    setBukSaving(true);
+    setBukError(null);
+    try {
+      const res = await fetch("/api/integrations/buk", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tenant: bukTenant, country: bukCountry, token: bukToken }),
+      });
+      const text = await res.text();
+      const data = text ? JSON.parse(text) : {};
+      if (!res.ok) {
+        setBukError(data.error ?? "Error al conectar con BUK");
+        return;
+      }
+      setBukStatus("connected");
+      setBukTenant("");
+      setBukToken("");
+      router.refresh();
+    } catch {
+      setBukError("Error inesperado. Revisa la consola del servidor.");
+    } finally {
+      setBukSaving(false);
+    }
+  }
+
+  async function handleDisconnectBuk() {
+    setBukDisconnecting(true);
+    try {
+      const res = await fetch("/api/integrations/buk/disconnect", { method: "POST" });
+      if (res.ok) {
+        setBukStatus("disconnected");
+        router.refresh();
+      }
+    } finally {
+      setBukDisconnecting(false);
     }
   }
 
@@ -185,6 +235,79 @@ export function SettingsForm({ userId, profile, toolSettings, telegramLinked, gi
             >
               Conectar GitHub
             </a>
+          </div>
+        )}
+      </section>
+
+      {/* BUK */}
+      <section className="space-y-4">
+        <h2 className="text-base font-semibold">BUK — Nómina y RRHH</h2>
+        {bukStatus === "connected" ? (
+          <div className="flex items-center justify-between rounded-md border border-neutral-200 p-4 dark:border-neutral-800">
+            <div className="flex items-center gap-2">
+              <span className="inline-block h-2 w-2 rounded-full bg-green-500" />
+              <span className="text-sm font-medium text-green-700 dark:text-green-400">Conectado</span>
+            </div>
+            <button
+              onClick={handleDisconnectBuk}
+              disabled={bukDisconnecting}
+              className="rounded-md border border-red-300 px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50 disabled:opacity-50 dark:border-red-700 dark:text-red-400 dark:hover:bg-red-900/20"
+            >
+              {bukDisconnecting ? "Desconectando..." : "Desconectar"}
+            </button>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <p className="text-sm text-neutral-500">
+              Conecta tu cuenta de BUK para consultar empleados, ausencias y vacaciones desde el agente.
+            </p>
+            <div className="space-y-2">
+              <div>
+                <label className="block text-xs font-medium mb-1 text-neutral-600 dark:text-neutral-400">URL del tenant</label>
+                <input
+                  type="url"
+                  placeholder="https://miempresa.buk.co"
+                  value={bukTenant}
+                  onChange={(e) => setBukTenant(e.target.value)}
+                  className="w-full rounded-md border border-neutral-300 bg-white px-3 py-2 text-sm dark:border-neutral-700 dark:bg-neutral-900"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium mb-1 text-neutral-600 dark:text-neutral-400">País</label>
+                <select
+                  value={bukCountry}
+                  onChange={(e) => setBukCountry(e.target.value)}
+                  className="w-full rounded-md border border-neutral-300 bg-white px-3 py-2 text-sm dark:border-neutral-700 dark:bg-neutral-900"
+                >
+                  <option value="colombia">Colombia</option>
+                  <option value="chile">Chile</option>
+                  <option value="mexico">México</option>
+                  <option value="peru">Perú</option>
+                  <option value="brasil">Brasil</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium mb-1 text-neutral-600 dark:text-neutral-400">API Key (auth_token)</label>
+                <input
+                  type="password"
+                  placeholder="Tu API Key de BUK"
+                  value={bukToken}
+                  onChange={(e) => setBukToken(e.target.value)}
+                  className="w-full rounded-md border border-neutral-300 bg-white px-3 py-2 text-sm dark:border-neutral-700 dark:bg-neutral-900"
+                />
+                <p className="text-xs text-neutral-400 mt-1">Generada en BUK: Configuración → Accesos API</p>
+              </div>
+            </div>
+            {bukError && (
+              <p className="text-sm text-red-600 dark:text-red-400">{bukError}</p>
+            )}
+            <button
+              onClick={handleConnectBuk}
+              disabled={bukSaving || !bukTenant || !bukToken}
+              className="rounded-md bg-neutral-900 px-4 py-2 text-sm font-medium text-white hover:bg-neutral-800 disabled:opacity-50 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-200"
+            >
+              {bukSaving ? "Verificando y conectando..." : "Conectar BUK"}
+            </button>
           </div>
         )}
       </section>
