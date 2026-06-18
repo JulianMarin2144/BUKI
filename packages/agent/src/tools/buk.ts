@@ -16,6 +16,9 @@ interface CacheEntry<T> {
 /** 3-minute TTL. HR data changes rarely; cache eliminates repeated full fetches within a session. */
 const CACHE_TTL_MS = 3 * 60 * 1000;
 
+/** Max records sent to the LLM per BUK response. Keeps token usage predictable. */
+const MAX_RECORDS_FOR_LLM = 50;
+
 const employeeCache = new Map<string, CacheEntry<Array<Record<string, unknown>>>>();
 const areaCache = new Map<string, CacheEntry<Map<string, string>>>();
 const absencesCache = new Map<string, CacheEntry<Array<Record<string, unknown>>>>();
@@ -383,9 +386,20 @@ export async function executeBukTool(
       const filtered = since
         ? data.filter((a) => (a.start_date as string) >= since)
         : data;
+
+      // Sort most recent first, then cap to MAX_RECORDS_FOR_LLM to keep token usage low
+      const sorted = [...filtered].sort((a, b) =>
+        String(b.start_date ?? "").localeCompare(String(a.start_date ?? ""))
+      );
+      const limited = sorted.slice(0, MAX_RECORDS_FOR_LLM);
+
       return {
         total: filtered.length,
-        absences: filtered.map((a) => ({
+        showing: limited.length,
+        ...(filtered.length > MAX_RECORDS_FOR_LLM
+          ? { note: `Mostrando los ${MAX_RECORDS_FOR_LLM} más recientes de ${filtered.length}. Usa since_date para filtrar por fecha.` }
+          : {}),
+        absences: limited.map((a) => ({
           id:            a.id,
           employee_id:   a.employee_id,
           employee_name: nameMap.get(String(a.employee_id)) ?? "—",
@@ -408,9 +422,20 @@ export async function executeBukTool(
         fetchAllEmployees(config),
       ]);
       const nameMap = buildNameMap(allEmployees);
+
+      // Sort most recent first, cap to MAX_RECORDS_FOR_LLM
+      const sorted = [...data].sort((a, b) =>
+        String(b.start_date ?? "").localeCompare(String(a.start_date ?? ""))
+      );
+      const limited = sorted.slice(0, MAX_RECORDS_FOR_LLM);
+
       return {
         total: data.length,
-        vacations: data.map((v) => ({
+        showing: limited.length,
+        ...(data.length > MAX_RECORDS_FOR_LLM
+          ? { note: `Mostrando las ${MAX_RECORDS_FOR_LLM} más recientes de ${data.length}.` }
+          : {}),
+        vacations: limited.map((v) => ({
           id:            v.id,
           employee_id:   v.employee_id,
           employee_name: nameMap.get(String(v.employee_id)) ?? "—",
@@ -433,10 +458,18 @@ export async function executeBukTool(
       const data = all.filter((a) =>
         licenceTypes.some((t) => normalize(String(a.type ?? "")).includes(t))
       );
+
+      // Sort most recent first, cap to MAX_RECORDS_FOR_LLM
+      const sorted = [...data].sort((a, b) =>
+        String(b.start_date ?? "").localeCompare(String(a.start_date ?? ""))
+      );
+      const limited = sorted.slice(0, MAX_RECORDS_FOR_LLM);
+
       return {
         total: data.length,
-        note:  "Licencias, impedimentos y permisos extraídos de los registros de ausencias.",
-        licenses: data.map((l) => ({
+        showing: limited.length,
+        note: `Licencias, impedimentos y permisos extraídos de ausencias.${data.length > MAX_RECORDS_FOR_LLM ? ` Mostrando los ${MAX_RECORDS_FOR_LLM} más recientes de ${data.length}.` : ""}`,
+        licenses: limited.map((l) => ({
           id:            l.id,
           employee_id:   l.employee_id,
           employee_name: nameMap.get(String(l.employee_id)) ?? "—",

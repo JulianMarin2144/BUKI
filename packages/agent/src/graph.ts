@@ -21,6 +21,15 @@ import {
 } from "@agents/types";
 import { createChatModel } from "./model";
 import { buildLangChainTools, TOOL_HANDLERS } from "./tools/adapters";
+
+// Module-level singleton: avoid re-instantiating ChatOpenAI on every request.
+// Safe because ChatOpenAI is stateless — all per-request state lives in the
+// invocation args (messages, config). Reset on hot-reload by the module itself.
+let _chatModelSingleton: ReturnType<typeof createChatModel> | null = null;
+function getChatModel(): ReturnType<typeof createChatModel> {
+  if (!_chatModelSingleton) _chatModelSingleton = createChatModel();
+  return _chatModelSingleton;
+}
 import type { ToolContext } from "./tools/adapters";
 import {
   addMessage,
@@ -99,7 +108,7 @@ function buildConfirmationMessage(
   }
 }
 
-const MAX_TOOL_ITERATIONS = 6;
+const MAX_TOOL_ITERATIONS = 10;
 
 export async function runAgent(input: AgentInput): Promise<AgentOutput> {
   const {
@@ -116,7 +125,7 @@ export async function runAgent(input: AgentInput): Promise<AgentOutput> {
     bypassConfirmation = false,
   } = input;
 
-  const model = createChatModel();
+  const model = getChatModel();
   const toolCtx: ToolContext = { db, userId, sessionId, enabledTools, integrations, githubToken, bukConfig };
   const lcTools = buildLangChainTools(toolCtx);
 
@@ -459,7 +468,7 @@ export async function* runAgentStream(input: AgentInput): AsyncGenerator<StreamC
 
   if (!message) return;
 
-  const model = createChatModel();
+  const model = getChatModel();
   const toolCtx: ToolContext = { db, userId, sessionId, enabledTools, integrations, githubToken, bukConfig };
   const lcTools = buildLangChainTools(toolCtx);
   const modelWithTools = lcTools.length > 0 ? model.bindTools(lcTools) : model;
@@ -519,8 +528,7 @@ export async function* runAgentStream(input: AgentInput): AsyncGenerator<StreamC
 
     const aiMsg = lastMsg as AIMessage;
     // Use LangChain tool_calls if available; fall back to raw additional_kwargs format.
-    const rawAkTcs = (aiMsg.additional_kwargs as Record<string, unknown>)?.tool_calls as
-      | Array<{ id: string; type: string; function: { name: string; arguments: string } }>
+    const rawAkTcs = (aiMsg.additional_kwargs as Record<string, unknown>)?.tool_calls as      | Array<{ id: string; type: string; function: { name: string; arguments: string } }>
       | undefined;
     const normalizedToolCalls: Array<{ id: string; name: string; args: Record<string, unknown> }> =
       (aiMsg.tool_calls?.length ?? 0) > 0
@@ -533,9 +541,60 @@ export async function* runAgentStream(input: AgentInput): AsyncGenerator<StreamC
               catch { return {} as Record<string, unknown>; }
             })(),
           }));
-    console.log(`[toolExecutorNode] executing ${normalizedToolCalls.length} tool(s): ${normalizedToolCalls.map(t => t.name).join(", ")}`);
 
     const results: BaseMessage[] = [];
+    console.log(`[toolExecutorNode] executing ${normalizedToolCalls.length} tool(s): ${normalizedToolCalls.map(t => t.name).join(", ")}`);
+
+    // Fast-path: if no tool requires HITL, run all concurrently with Promise.all.
+    // Sequential path is only needed when interrupt() must pause graph execution.
+    const anyRequiresHITL = !bypassConfirmation && normalizedToolCalls.some((tc) => {
+      const def = TOOL_CATALOG.find((t) => t.name === tc.name);
+      return !!def && toolRequiresConfirmation(def.id ?? tc.name);
+    });
+
+    if (!anyRequiresHITL) {
+      const t0 = Date.now();
+      const parallelResults = await Promise.all(
+        normalizedToolCalls.map(async (tc): Promise<BaseMessage> => {
+          toolCallNames.push(tc.name);
+
+          if (bypassConfirmation) {
+            const def = TOOL_CATALOG.find((t) => t.name === tc.name);
+            const toolId = def?.id ?? tc.name;
+            if (def && toolRequiresConfirmation(toolId)) {
+              const record = await createToolCall(db, sessionId, toolId, tc.args as Record<string, unknown>, true);
+              await updateToolCallStatus(db, record.id, "approved");
+              const autoHandler = TOOL_HANDLERS[toolId];
+              try {
+                const result = await autoHandler(tc.args as Record<string, unknown>, toolCtx);
+                await updateToolCallStatus(db, record.id, "executed", result);
+                return new ToolMessage({ content: JSON.stringify(result), tool_call_id: tc.id! });
+              } catch (err) {
+                const errResult = { error: String(err) };
+                await updateToolCallStatus(db, record.id, "failed", errResult);
+                return new ToolMessage({ content: JSON.stringify(errResult), tool_call_id: tc.id! });
+              }
+            }
+          }
+
+          const matchingTool = lcTools.find((t) => t.name === tc.name);
+          if (!matchingTool) {
+            return new ToolMessage({ content: JSON.stringify({ error: `Tool '${tc.name}' not available` }), tool_call_id: tc.id! });
+          }
+          try {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const rawResult = await (matchingTool as any).invoke(tc.args, config);
+            return new ToolMessage({ content: String(rawResult), tool_call_id: tc.id! });
+          } catch (err) {
+            return new ToolMessage({ content: JSON.stringify({ error: String(err) }), tool_call_id: tc.id! });
+          }
+        })
+      );
+      console.log(`[toolExecutorNode] parallel ${normalizedToolCalls.length} tool(s) in ${Date.now() - t0}ms`);
+      return { messages: parallelResults };
+    }
+
+    // Sequential path — required when interrupt() is involved (HITL confirmation)
     for (const tc of normalizedToolCalls) {
       const def = TOOL_CATALOG.find((t) => t.name === tc.name);
       const toolId = def?.id ?? tc.name;
@@ -759,6 +818,11 @@ export async function* runAgentStream(input: AgentInput): AsyncGenerator<StreamC
   flushSessionMemory({ db, userId, sessionId }).catch((err) =>
     console.error("[stream] memory flush failed:", err)
   );
+
+  if (!finalResponse.trim()) {
+    yield { type: "error", message: "No se obtuvo respuesta. Por favor intenta de nuevo o crea una nueva sesión." };
+    return;
+  }
 
   yield { type: "done", response: finalResponse, toolCalls: toolCallNames };
 }
