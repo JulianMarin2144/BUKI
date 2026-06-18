@@ -6,15 +6,50 @@ export interface BukConfig {
   token: string;
 }
 
-async function bukFetch(config: BukConfig, path: string) {
+// ── In-memory cache ───────────────────────────────────────────────────────────
+
+interface CacheEntry<T> {
+  data: T;
+  expiresAt: number;
+}
+
+/** 3-minute TTL. HR data changes rarely; cache eliminates repeated full fetches within a session. */
+const CACHE_TTL_MS = 3 * 60 * 1000;
+
+const employeeCache = new Map<string, CacheEntry<Array<Record<string, unknown>>>>();
+const areaCache = new Map<string, CacheEntry<Map<string, string>>>();
+const absencesCache = new Map<string, CacheEntry<Array<Record<string, unknown>>>>();
+const vacationsCache = new Map<string, CacheEntry<Array<Record<string, unknown>>>>();
+
+function cacheKey(config: BukConfig): string {
+  return `${config.tenant}:${config.country}`;
+}
+
+// ── HTTP ──────────────────────────────────────────────────────────────────────
+
+async function bukFetch(config: BukConfig, path: string, timeoutMs = 25_000) {
   const url = `${config.tenant}/api/v1/${config.country}${path}`;
-  const res = await fetch(url, {
-    headers: {
-      auth_token: config.token,
-      Accept: "application/json",
-      "User-Agent": BUK_UA,
-    },
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        auth_token: config.token,
+        Accept: "application/json",
+        "User-Agent": BUK_UA,
+      },
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    if ((err as { name?: string }).name === "AbortError") {
+      console.error("[buk] request timeout", url);
+      throw new Error(`BUK API timeout after ${timeoutMs / 1000}s: ${url}`);
+    }
+    throw err;
+  }
+  clearTimeout(timer);
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     console.error("[buk] API error", res.status, url, body.slice(0, 200));
@@ -22,6 +57,8 @@ async function bukFetch(config: BukConfig, path: string) {
   }
   return res.json();
 }
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 /** Normalize: lowercase + strip accents so "Julián" matches "julian" */
 function normalize(s: string): string {
@@ -72,25 +109,61 @@ function formatEmployee(e: Record<string, unknown>, areaMap?: Map<string, string
   };
 }
 
-/** Fetch all employees (up to 500) and return a person_id → name map (all statuses for cross-reference) */
-async function buildEmployeeNameMap(config: BukConfig): Promise<Map<string, string>> {
-  const map = new Map<string, string>();
-  for (let page = 1; page <= 6; page++) {
-    const data = await bukFetch(config, `/employees?page=${page}&page_size=100`);
-    const batch = unwrapArray(data);
-    if (batch.length === 0) break;
-    for (const e of batch) {
-      const id = String(e.person_id ?? e.id);
-      const status = String(e.status ?? "").toLowerCase();
-      map.set(id, `${getEmployeeName(e)}${status !== "activo" ? ` (${e.status})` : ""}`);
-    }
-    if (batch.length < 100) break;
+// ── Parallel data fetchers with TTL cache ─────────────────────────────────────
+
+/**
+ * Fetch ALL employees using parallel pagination.
+ * Results are cached for CACHE_TTL_MS to avoid repeated full fetches within a session.
+ *
+ * Strategy:
+ *  1. Return from cache if fresh.
+ *  2. Probe page 1. If it has < 100 items, we're done.
+ *  3. If page 1 is full (100 items), launch pages 2–12 in parallel with Promise.all.
+ *  4. Iterate results in page order, stopping at the first empty or partial page.
+ */
+async function fetchAllEmployees(config: BukConfig): Promise<Array<Record<string, unknown>>> {
+  const key = cacheKey(config);
+  const entry = employeeCache.get(key);
+  if (entry && entry.expiresAt > Date.now()) {
+    console.log("[buk] employees served from cache");
+    return entry.data;
   }
-  return map;
+
+  const t0 = Date.now();
+
+  // Probe page 1
+  const firstData = await bukFetch(config, "/employees?page=1&page_size=100");
+  const firstBatch = unwrapArray(firstData);
+  let all = [...firstBatch];
+
+  if (firstBatch.length === 100) {
+    // More pages likely exist — fetch pages 2–12 in parallel
+    const MAX_PAGES = 12;
+    const remainingResults = await Promise.all(
+      Array.from({ length: MAX_PAGES - 1 }, (_, i) => i + 2).map((p) =>
+        bukFetch(config, `/employees?page=${p}&page_size=100`)
+          .then(unwrapArray)
+          .catch((): Array<Record<string, unknown>> => [])
+      )
+    );
+    for (const batch of remainingResults) {
+      if (batch.length === 0) break;       // empty page = no more data
+      all = all.concat(batch);
+      if (batch.length < 100) break;       // partial page = last page
+    }
+  }
+
+  console.log(`[buk] fetched ${all.length} employees in ${Date.now() - t0}ms (cached for ${CACHE_TTL_MS / 1000}s)`);
+  employeeCache.set(key, { data: all, expiresAt: Date.now() + CACHE_TTL_MS });
+  return all;
 }
 
-/** Fetch all areas and return area_id → name map */
-async function buildAreaMap(config: BukConfig): Promise<Map<string, string>> {
+/** Fetch area id→name map with TTL cache. */
+async function fetchAreaMap(config: BukConfig): Promise<Map<string, string>> {
+  const key = cacheKey(config);
+  const entry = areaCache.get(key);
+  if (entry && entry.expiresAt > Date.now()) return entry.data;
+
   const map = new Map<string, string>();
   try {
     const data = await bukFetch(config, "/areas");
@@ -98,24 +171,66 @@ async function buildAreaMap(config: BukConfig): Promise<Map<string, string>> {
     for (const a of areas) {
       map.set(String(a.id), String(a.name ?? a.nombre ?? ""));
     }
-  } catch { /* areas endpoint optional */ }
+  } catch { /* areas endpoint is optional */ }
+
+  areaCache.set(key, { data: map, expiresAt: Date.now() + CACHE_TTL_MS });
   return map;
 }
 
-/** Fetch all employees and return count breakdown by status */
-async function countEmployeesByStatus(config: BukConfig): Promise<{ active: number; inactive: number; total: number }> {
+/** Fetch all absences with TTL cache. */
+async function fetchAllAbsences(config: BukConfig): Promise<Array<Record<string, unknown>>> {
+  const key = cacheKey(config);
+  const entry = absencesCache.get(key);
+  if (entry && entry.expiresAt > Date.now()) {
+    console.log("[buk] absences served from cache");
+    return entry.data;
+  }
+  const raw = await bukFetch(config, "/absences");
+  const data = unwrapArray(raw);
+  absencesCache.set(key, { data, expiresAt: Date.now() + CACHE_TTL_MS });
+  return data;
+}
+
+/** Fetch all vacations with TTL cache. */
+async function fetchAllVacations(config: BukConfig): Promise<Array<Record<string, unknown>>> {
+  const key = cacheKey(config);
+  const entry = vacationsCache.get(key);
+  if (entry && entry.expiresAt > Date.now()) {
+    console.log("[buk] vacations served from cache");
+    return entry.data;
+  }
+  const raw = await bukFetch(config, "/vacations");
+  const data = unwrapArray(raw);
+  vacationsCache.set(key, { data, expiresAt: Date.now() + CACHE_TTL_MS });
+  return data;
+}
+
+/** Pure — count active/inactive from a pre-fetched employee array (no HTTP call). */
+function countByStatus(employees: Array<Record<string, unknown>>): {
+  active: number;
+  inactive: number;
+  total: number;
+} {
   let active = 0, inactive = 0;
-  for (let page = 1; page <= 12; page++) {
-    const data = await bukFetch(config, `/employees?page=${page}&page_size=100`);
-    const batch = unwrapArray(data);
-    for (const e of batch) {
-      if (String(e.status ?? "").toLowerCase() === "activo") active++;
-      else inactive++;
-    }
-    if (batch.length < 100) break;
+  for (const e of employees) {
+    if (String(e.status ?? "").toLowerCase() === "activo") active++;
+    else inactive++;
   }
   return { active, inactive, total: active + inactive };
 }
+
+/** Pure — build id→displayName map from a pre-fetched employee array. */
+function buildNameMap(employees: Array<Record<string, unknown>>): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const e of employees) {
+    const id = String(e.person_id ?? e.id);
+    const status = String(e.status ?? "").toLowerCase();
+    map.set(id, `${getEmployeeName(e)}${status !== "activo" ? ` (${e.status})` : ""}`);
+  }
+  return map;
+}
+
+// ── Tool executor ─────────────────────────────────────────────────────────────
 
 export async function executeBukTool(
   toolName: string,
@@ -129,81 +244,67 @@ export async function executeBukTool(
   switch (toolName) {
 
     case "buk_list_employees": {
-      const filterName = (args.name as string | undefined);
-      const filterArea = (args.area as string | undefined);
-      const page = (args.page as number) ?? 1;
-      const countOnly = !!(args.count_only);
+      const filterName    = args.name as string | undefined;
+      const filterArea    = args.area as string | undefined;
+      const page          = (args.page as number) ?? 1;
+      const countOnly     = !!(args.count_only);
+      const includeInactive = !!(args.include_inactive);
 
-      // If only count requested, return full breakdown
+      // Fetch employees and areas in parallel — both use the cache on subsequent calls
+      const [allEmployees, areaMap] = await Promise.all([
+        fetchAllEmployees(config),
+        fetchAreaMap(config),
+      ]);
+
+      // Pure helpers rely on in-memory data — no extra HTTP calls
+      const counts = countByStatus(allEmployees);
+
       if (countOnly) {
-        const counts = await countEmployeesByStatus(config);
         return {
-          active_employees: counts.active,
+          active_employees:   counts.active,
           inactive_employees: counts.inactive,
-          total_employees: counts.total,
+          total_employees:    counts.total,
         };
       }
 
-      // By default only show active employees; pass include_inactive=true to see all
-      const includeInactive = !!(args.include_inactive);
       const nameWords = filterName ? normalize(filterName).split(/\s+/).filter(Boolean) : [];
       const areaWords = filterArea ? normalize(filterArea).split(/\s+/).filter(Boolean) : [];
       const isSearching = nameWords.length > 0 || areaWords.length > 0;
 
-      const areaMap = await buildAreaMap(config);
-
+      function isActive(e: Record<string, unknown>): boolean {
+        return String(e.status ?? "").toLowerCase() === "activo";
+      }
       function matchesName(e: Record<string, unknown>): boolean {
         if (nameWords.length === 0) return true;
         return nameWords.every((w) => normalize(getEmployeeName(e)).includes(w));
       }
-
       function matchesArea(e: Record<string, unknown>): boolean {
         if (areaWords.length === 0) return true;
         const job = e.current_job as Record<string, unknown> | undefined;
         const areaId = String(job?.area_id ?? "");
-        const areaName = areaMap.get(areaId) ?? "";
-        const hay = normalize(areaName);
+        const hay = normalize(areaMap.get(areaId) ?? "");
         return areaWords.every((w) => hay.includes(w));
       }
 
-      function isActive(e: Record<string, unknown>): boolean {
-        return String(e.status ?? "").toLowerCase() === "activo";
-      }
-
-      let employees: Array<Record<string, unknown>> = [];
-      let counts: { active: number; inactive: number; total: number } | undefined;
+      let employees: Array<Record<string, unknown>>;
 
       if (isSearching) {
-        for (let currentPage = 1; currentPage <= 12; currentPage++) {
-          const data = await bukFetch(config, `/employees?page=${currentPage}&page_size=100`);
-          const batch = unwrapArray(data);
-          if (batch.length === 0) break;
-          employees = employees.concat(batch);
-          const matchCount = employees
-            .filter((e) => (includeInactive || isActive(e)) && matchesName(e) && matchesArea(e)).length;
-          if (matchCount > 0 && batch.length < 100) break;
-          if (batch.length < 100) break;
-        }
-        employees = employees.filter((e) =>
-          (includeInactive || isActive(e)) && matchesName(e) && matchesArea(e)
+        employees = allEmployees.filter(
+          (e) => (includeInactive || isActive(e)) && matchesName(e) && matchesArea(e)
         );
       } else {
-        const [data, c] = await Promise.all([
-          bukFetch(config, `/employees?page=${page}&page_size=25`),
-          countEmployeesByStatus(config),
-        ]);
-        counts = c;
-        employees = unwrapArray(data).filter((e) => includeInactive || isActive(e));
+        // In-memory pagination over active (or all) employees
+        const pool = allEmployees.filter((e) => includeInactive || isActive(e));
+        const offset = (page - 1) * 25;
+        employees = pool.slice(offset, offset + 25);
       }
 
       const limited = employees.slice(0, 25);
 
       return {
-        ...(counts ? {
-          active_employees: counts.active,
-          inactive_employees: counts.inactive,
-          total_employees: counts.total,
-        } : { showing_count: limited.length }),
+        active_employees:   counts.active,
+        inactive_employees: counts.inactive,
+        total_employees:    counts.total,
         ...(isSearching ? {} : { page }),
         employees: limited.map((e) => formatEmployee(e, areaMap)),
       };
@@ -211,32 +312,26 @@ export async function executeBukTool(
 
     case "buk_get_employee": {
       if (!args.id) throw new Error("Se requiere el ID del empleado");
-      const areaMap = await buildAreaMap(config);
 
-      // Try direct lookup first
+      // Try direct API lookup first (faster for known IDs)
       const res1 = await bukFetch(config, `/employees/${args.id}`).catch(() => null);
       let e: Record<string, unknown> | null = null;
       if (res1 && !Array.isArray(res1) && (res1 as Record<string, unknown>).person_id) {
         e = res1 as Record<string, unknown>;
       }
 
-      // Fallback: find in full employee list (paginated)
+      // Fallback: search in cached full employee list (no extra HTTP calls)
       if (!e) {
-        for (let page = 1; page <= 12; page++) {
-          const data = await bukFetch(config, `/employees?page=${page}&page_size=100`);
-          const batch = unwrapArray(data);
-          if (batch.length === 0) break;
-          const found = batch.find(
-            (emp) => String(emp.person_id) === String(args.id) || String(emp.id) === String(args.id)
-          );
-          if (found) { e = found; break; }
-          if (batch.length < 100) break;
-        }
+        const all = await fetchAllEmployees(config);
+        e = all.find(
+          (emp) => String(emp.person_id) === String(args.id) || String(emp.id) === String(args.id)
+        ) ?? null;
       }
 
       if (!e) throw new Error(`Empleado con ID ${args.id} no encontrado`);
 
-      const job = e.current_job as Record<string, unknown> | undefined;
+      const areaMap = await fetchAreaMap(config);
+      const job  = e.current_job as Record<string, unknown> | undefined;
       const role = job?.role as Record<string, unknown> | undefined;
       const jobs = (e.jobs as Array<Record<string, unknown>> | undefined) ?? [];
       const areaId = String(job?.area_id ?? "");
@@ -248,55 +343,56 @@ export async function executeBukTool(
         : e.active_since;
 
       return {
-        person_id: e.person_id,
-        name: getEmployeeName(e),
-        document_type: e.document_type,
-        document_number: e.document_number,
-        email: e.email,
-        personal_email: e.personal_email,
-        phone: e.phone,
-        job_title: role?.name ?? job?.name,
-        area: areaMap.get(areaId) ?? (areaId ? `área_id:${areaId}` : undefined),
-        hire_date: firstJobStart,
-        current_job_start: job?.start_date,
-        contract_type: job?.type_of_contract,
-        status: e.status,
-        gender: e.gender,
-        birthday: e.birthday,
-        address: e.address,
-        district: e.district,
-        health_company: e.health_company,
-        pension_fund: (e.custom_attributes as Record<string, unknown>)?.["AFP (Administrador Fondo de Pensiones)"],
-        pension_regime: e.pension_regime,
+        person_id:          e.person_id,
+        name:               getEmployeeName(e),
+        document_type:      e.document_type,
+        document_number:    e.document_number,
+        email:              e.email,
+        personal_email:     e.personal_email,
+        phone:              e.phone,
+        job_title:          role?.name ?? job?.name,
+        area:               areaMap.get(areaId) ?? (areaId ? `área_id:${areaId}` : undefined),
+        hire_date:          firstJobStart,
+        current_job_start:  job?.start_date,
+        contract_type:      job?.type_of_contract,
+        status:             e.status,
+        gender:             e.gender,
+        birthday:           e.birthday,
+        address:            e.address,
+        district:           e.district,
+        health_company:     e.health_company,
+        pension_fund:       (e.custom_attributes as Record<string, unknown>)?.["AFP (Administrador Fondo de Pensiones)"],
+        pension_regime:     e.pension_regime,
         job_history: jobs.map((j) => ({
-          start_date: j.start_date,
-          end_date: j.end_date ?? "actual",
-          role: (j.role as Record<string, unknown>)?.name,
+          start_date:    j.start_date,
+          end_date:      j.end_date ?? "actual",
+          role:          (j.role as Record<string, unknown>)?.name,
           contract_type: j.type_of_contract,
         })),
       };
     }
 
     case "buk_list_absences": {
-      const raw = await bukFetch(config, "/absences");
-      const data = unwrapArray(raw);
-      // Build employee name map to resolve IDs → names
-      const nameMap = await buildEmployeeNameMap(config);
-      // Optional: filter by recent (last 12 months) if data seems old
-      const since = args.since_date as string | undefined;
+      // Fetch absences and employee name map in parallel — both use cache on subsequent calls
+      const [data, allEmployees] = await Promise.all([
+        fetchAllAbsences(config),
+        fetchAllEmployees(config),
+      ]);
+      const nameMap = buildNameMap(allEmployees);
+      const since   = args.since_date as string | undefined;
       const filtered = since
         ? data.filter((a) => (a.start_date as string) >= since)
         : data;
       return {
         total: filtered.length,
         absences: filtered.map((a) => ({
-          id: a.id,
-          employee_id: a.employee_id,
+          id:            a.id,
+          employee_id:   a.employee_id,
           employee_name: nameMap.get(String(a.employee_id)) ?? "—",
-          type: a.type,
-          start_date: a.start_date,
-          end_date: a.end_date,
-          status: a.status,
+          type:          a.type,
+          start_date:    a.start_date,
+          end_date:      a.end_date,
+          status:        a.status,
         })),
       };
     }
@@ -306,44 +402,48 @@ export async function executeBukTool(
         const data = await bukFetch(config, `/employees/${args.employee_id}/vacations`) as Record<string, unknown>;
         return { employee_id: args.employee_id, vacations: unwrapArray(data) };
       }
-      const raw = await bukFetch(config, "/vacations");
-      const data = unwrapArray(raw);
-      const nameMap = await buildEmployeeNameMap(config);
+      // Fetch vacations and employee name map in parallel — both use cache on subsequent calls
+      const [data, allEmployees] = await Promise.all([
+        fetchAllVacations(config),
+        fetchAllEmployees(config),
+      ]);
+      const nameMap = buildNameMap(allEmployees);
       return {
         total: data.length,
         vacations: data.map((v) => ({
-          id: v.id,
-          employee_id: v.employee_id,
+          id:            v.id,
+          employee_id:   v.employee_id,
           employee_name: nameMap.get(String(v.employee_id)) ?? "—",
-          start_date: v.start_date,
-          end_date: v.end_date,
-          status: v.status,
-          days: v.days,
+          start_date:    v.start_date,
+          end_date:      v.end_date,
+          status:        v.status,
+          days:          v.days,
         })),
       };
     }
 
     case "buk_list_licenses": {
-      // Licences in BUK Colombia are tracked under /absences with type "Licencia"/"Impedimento"
-      // The /employees/licences endpoint fails with auth; use absences filtered by type instead
-      const raw = await bukFetch(config, "/absences");
-      const all = unwrapArray(raw);
-      const nameMap = await buildEmployeeNameMap(config);
+      // Fetch absences and employee name map in parallel — both use cache on subsequent calls
+      const [all, allEmployees] = await Promise.all([
+        fetchAllAbsences(config),
+        fetchAllEmployees(config),
+      ]);
+      const nameMap = buildNameMap(allEmployees);
       const licenceTypes = ["licencia", "impedimento", "permiso", "licence", "permission"];
       const data = all.filter((a) =>
         licenceTypes.some((t) => normalize(String(a.type ?? "")).includes(t))
       );
       return {
         total: data.length,
-        note: "Licencias, impedimentos y permisos extraídos de los registros de ausencias.",
+        note:  "Licencias, impedimentos y permisos extraídos de los registros de ausencias.",
         licenses: data.map((l) => ({
-          id: l.id,
-          employee_id: l.employee_id,
+          id:            l.id,
+          employee_id:   l.employee_id,
           employee_name: nameMap.get(String(l.employee_id)) ?? "—",
-          type: l.type,
-          start_date: l.start_date,
-          end_date: l.end_date,
-          status: l.status,
+          type:          l.type,
+          start_date:    l.start_date,
+          end_date:      l.end_date,
+          status:        l.status,
         })),
       };
     }

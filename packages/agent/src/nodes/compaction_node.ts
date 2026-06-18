@@ -152,6 +152,9 @@ async function llmCompact(
   return stripAnalysisBlock(raw);
 }
 
+/** Minimum messages before microcompact runs (skip O(n) scan on short conversations). */
+const MICROCOMPACT_MIN_MESSAGES = 10;
+
 // ─── Node ────────────────────────────────────────────────────────────────────
 
 export async function compactionNode(
@@ -160,8 +163,10 @@ export async function compactionNode(
 ): Promise<Partial<typeof GraphState.State>> {
   const { messages, compactionCount } = state;
 
-  // ── Stage 1: Microcompact (always runs, zero cost) ───────────────────────
-  const afterMicro = microcompact(messages);
+  // ── Stage 1: Microcompact (skip if conversation is short — avoids O(n) scan) ─
+  const afterMicro = messages.length >= MICROCOMPACT_MIN_MESSAGES
+    ? microcompact(messages)
+    : messages;
 
   // ── Circuit breaker: skip LLM compaction after repeated failures ─────────
   if (compactionCount >= CIRCUIT_BREAKER_LIMIT) {

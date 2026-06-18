@@ -7,6 +7,9 @@ export function createChatModel() {
   return new ChatOpenAI({
     modelName: "openai/gpt-4o-mini",
     temperature: 0.3,
+    // streaming is handled by LangGraph streamEvents via callbacks —
+    // do NOT set streaming:true here because it can cause tool_call
+    // chunks to not accumulate properly in the final AIMessage.
     configuration: {
       baseURL: "https://openrouter.ai/api/v1",
       defaultHeaders: {

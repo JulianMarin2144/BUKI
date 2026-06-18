@@ -17,6 +17,8 @@ interface Message {
   created_at?: string;
   confirmation?: PendingConfirmation;
   confirmationStatus?: "pending" | "approved" | "rejected";
+  streaming?: boolean;
+  toolCalls?: string[];
 }
 
 interface SessionItem {
@@ -100,6 +102,10 @@ export function ChatInterface({
   const [sessionList, setSessionList] = useState<SessionItem[]>(sessions);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  // Token batching: accumulate SSE tokens and flush via rAF (~16ms) instead of
+  // calling setMessages on every single token (which was blocking the main thread).
+  const streamTokenBuf = useRef("");
+  const streamRafId = useRef<number | null>(null);
 
   const supabase = createBrowserClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -109,6 +115,24 @@ export function ChatInterface({
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  function scheduleTokenFlush() {
+    if (streamRafId.current !== null) return;
+    streamRafId.current = requestAnimationFrame(() => {
+      streamRafId.current = null;
+      const accumulated = streamTokenBuf.current;
+      if (!accumulated) return;
+      streamTokenBuf.current = "";
+      setMessages((prev) => {
+        const next = [...prev];
+        const last = next[next.length - 1];
+        if (last?.streaming) {
+          next[next.length - 1] = { ...last, content: last.content + accumulated };
+        }
+        return next;
+      });
+    });
+  }
 
   async function handleSwitchSession(sessionId: string) {
     if (sessionId === activeSessionId) return;
@@ -223,6 +247,10 @@ export function ChatInterface({
     setInput("");
     setLoading(true);
 
+    // Add a streaming placeholder for the assistant response
+    const streamingPlaceholder: Message = { role: "assistant", content: "", streaming: true };
+    setMessages((prev) => [...prev, streamingPlaceholder]);
+
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
@@ -230,31 +258,100 @@ export function ChatInterface({
         body: JSON.stringify({ message: text, sessionId: activeSessionId }),
       });
 
-      const data = await res.json();
-
-      if (data.response) {
-        setMessages((prev) => [
-          ...prev,
-          { role: "assistant", content: data.response },
-        ]);
+      if (!res.ok || !res.body) {
+        setMessages((prev) => {
+          const next = [...prev];
+          next[next.length - 1] = { role: "assistant", content: "Error al procesar tu mensaje. Intenta de nuevo." };
+          return next;
+        });
+        return;
       }
 
-      if (data.pendingConfirmation) {
-        setMessages((prev) => [
-          ...prev,
-          {
-            role: "assistant",
-            content: data.pendingConfirmation.message,
-            confirmation: data.pendingConfirmation,
-            confirmationStatus: "pending",
-          },
-        ]);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let activeToolCalls: string[] = [];
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          try {
+            const chunk = JSON.parse(line.slice(6));
+
+            if (chunk.type === "token") {
+              // Buffer tokens and flush via rAF — avoids blocking main thread on every token.
+              streamTokenBuf.current += chunk.text;
+              scheduleTokenFlush();
+
+            } else if (chunk.type === "tool_call") {
+              activeToolCalls = [...activeToolCalls, chunk.name];
+              setMessages((prev) => {
+                const next = [...prev];
+                const last = next[next.length - 1];
+                if (last?.streaming) {
+                  next[next.length - 1] = { ...last, toolCalls: activeToolCalls };
+                }
+                return next;
+              });
+
+            } else if (chunk.type === "done") {
+              // Flush any buffered tokens before finalizing the message
+              if (streamRafId.current !== null) {
+                cancelAnimationFrame(streamRafId.current);
+                streamRafId.current = null;
+              }
+              const remaining = streamTokenBuf.current;
+              streamTokenBuf.current = "";
+
+              setMessages((prev) => {
+                const next = [...prev];
+                const last = next[next.length - 1];
+                const streamed = (last?.content ?? "") + remaining;
+                const finalContent = chunk.response?.trim() ? chunk.response : streamed.trim() ? streamed : "";
+                next[next.length - 1] = { role: "assistant", content: finalContent };
+                return next;
+              });
+
+            } else if (chunk.type === "pending") {
+              setMessages((prev) => {
+                const next = [...prev];
+                next[next.length - 1] = {
+                  role: "assistant",
+                  content: chunk.data.message,
+                  confirmation: chunk.data,
+                  confirmationStatus: "pending",
+                };
+                return next;
+              });
+
+            } else if (chunk.type === "error") {
+              setMessages((prev) => {
+                const next = [...prev];
+                next[next.length - 1] = { role: "assistant", content: "Error al procesar tu mensaje. Intenta de nuevo." };
+                return next;
+              });
+            }
+          } catch { /* malformed JSON line, skip */ }
+        }
       }
     } catch {
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: "Error al procesar tu mensaje. Intenta de nuevo." },
-      ]);
+      setMessages((prev) => {
+        const next = [...prev];
+        const last = next[next.length - 1];
+        if (last?.streaming || last?.role === "assistant") {
+          next[next.length - 1] = { role: "assistant", content: "Error al procesar tu mensaje. Intenta de nuevo." };
+        } else {
+          next.push({ role: "assistant", content: "Error al procesar tu mensaje. Intenta de nuevo." });
+        }
+        return next;
+      });
     } finally {
       setLoading(false);
     }
@@ -360,7 +457,25 @@ export function ChatInterface({
                     <p className="whitespace-pre-wrap">{msg.content}</p>
                   ) : (
                     <div className="prose prose-sm max-w-none dark:prose-invert prose-p:my-1 prose-li:my-0.5 prose-ul:my-1 prose-ol:my-1 prose-strong:font-semibold">
-                      <ReactMarkdown>{msg.content}</ReactMarkdown>
+                      {msg.toolCalls && msg.toolCalls.length > 0 && (
+                        <p className="text-xs text-neutral-400 dark:text-neutral-500 mb-1 italic">
+                          {msg.toolCalls.map(t => {
+                            if (t.includes("buk")) return "Consultando BUK...";
+                            if (t.includes("github")) return "Consultando GitHub...";
+                            return `Ejecutando ${t}...`;
+                          }).join(" · ")}
+                        </p>
+                      )}
+                      {msg.content ? (
+                        msg.streaming ? (
+                          // Plain text during streaming — avoids O(n²) markdown re-parsing per token
+                          <span className="whitespace-pre-wrap">{msg.content}</span>
+                        ) : (
+                          <ReactMarkdown>{msg.content}</ReactMarkdown>
+                        )
+                      ) : msg.streaming ? (
+                        <span className="animate-pulse text-neutral-400">▍</span>
+                      ) : null}
                     </div>
                   )}
                   {msg.confirmation && msg.confirmationStatus === "pending" && (
@@ -390,7 +505,7 @@ export function ChatInterface({
                 </div>
               </div>
             ))}
-            {loading && (
+            {loading && !messages.some(m => m.streaming) && (
               <div className="flex justify-start">
                 <div className="rounded-lg bg-neutral-100 px-4 py-2.5 text-sm dark:bg-neutral-800">
                   <span className="animate-pulse">Pensando...</span>
